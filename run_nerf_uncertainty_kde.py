@@ -84,38 +84,6 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network_alpha(inputs, fn, embed_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'.
-    """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
-
-    alpha_var_feature = batchify(fn, netchunk)(embedded) # (BxN,1) (BxN,256)
-    alpha_flat = alpha_var_feature[:,0]
-    alpha_flat = alpha_flat[...,None]
-    var_flat = alpha_var_feature[:,1]
-    var_flat = var_flat[...,None]
-    feature = alpha_var_feature[:,2:]
-    alpha = torch.reshape(alpha_flat, list(inputs.shape[:-1]) + [alpha_flat.shape[-1]]) # (B,N,1)
-    var = torch.reshape(var_flat, list(inputs.shape[:-1]) + [var_flat.shape[-1]]) # (B,N,1)
-    return alpha, var, feature
-
-def run_network_rgb(inputs, viewdirs, feature, fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'.
-    """
-
-    input_dirs = viewdirs[:,None].expand(inputs.shape)
-    input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-    embedded_dirs = embeddirs_fn(input_dirs_flat)
-    embedded = torch.cat([feature, embedded_dirs], -1)
-
-    rgb_var_flat = batchify(fn, netchunk)(embedded)
-    rgb_flat = rgb_var_flat[:,:3]
-    var_flat = rgb_var_flat[:,3:]
-    rgb = torch.reshape(rgb_flat, list(inputs.shape[:-1]) + [rgb_flat.shape[-1]])
-    var = torch.reshape(var_flat, list(inputs.shape[:-1]) + [var_flat.shape[-1]])
-    return rgb, var
-
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
@@ -437,27 +405,29 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     ## generate alpha composited color weights for importance sampling  
     alpha = 1.-torch.exp(-alpha_mean*dists) # [N_rays, N_samples]
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1] # [N_rays, N_samples]
-
     ## sample K1 value for rgb and alpha respectively at each sampling point, 
     ## then generate K3 predictive values for each ray color
-    k3 = 30
-    rgb_xi = np.broadcast_to(0.4*np.random.rand(k3)-0.2, list(rgb_mean.shape) + [k3]) # [N_rays, N_samples, 3, k3]
+    k3 = 100
+    rgb_xi = np.broadcast_to(np.random.randn(k3), list(rgb_mean.shape) + [k3]) # [N_rays, N_samples, 3, k3]
     rgb_xi = torch.tensor(rgb_xi.copy())
     # rgb_xi = torch.zeros(list(rgb_mean.shape) + [k3])
     rgbs = rgb_mean[...,None].repeat(1,1,1,k3) + rgb_xi * rgb_var[...,None].repeat(1,1,1,k3) # [N_rays, N_samples, 3, k3]
-    alpha_xi = np.broadcast_to(0.4*np.random.rand(k3)-0.2, list(alpha_mean.shape) + [k3]) # [N_rays, N_samples, k3]
+    alpha_xi = np.broadcast_to(np.random.randn(k3), list(alpha_mean.shape) + [k3]) # [N_rays, N_samples, k3]
     alpha_xi = torch.tensor(alpha_xi.copy())
     # alpha_xi = torch.zeros(list(alpha_mean.shape) + [k3])
     alphas = alpha_mean[...,None].repeat(1,1,k3) + alpha_xi * alpha_var[...,None].repeat(1,1,k3) # [N_rays, N_samples, k3]
     # print('alpha_mean:',alpha_mean)
     # print('alphas:',alphas)
     ## alphas cannot be negative
-    alphas = torch.relu(alphas)
+    # alphas = torch.relu(alphas)
+    alphas = torch.exp(alphas)
+
     ## rgb cannot be negative
     rgbs = torch.relu(rgbs) 
     ## rgb and alpha should be between (0,1)
     # rgbs = torch.clamp(rgbs, min=0, max=1)
     # alphas = torch.clamp(alphas, min=0, max=1)
+    
 
     alpha_com = 1.-torch.exp(-alphas * dists[...,None].repeat(1,1,k3)) # [N_rays, N_samples, k3]
     weights_com = alpha_com * torch.cumprod(torch.cat([torch.ones((alpha_com.shape[0], 1, alpha_com.shape[-1])), 1.-alpha_com + 1e-10], -2), -2)[:, :-1,:] # [N_rays, N_samples, k3]
@@ -622,7 +592,7 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*8, 
+    parser.add_argument("--chunk", type=int, default=1024*4, 
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk_per_gpu", type=int, default=1024*64*4, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
@@ -965,7 +935,13 @@ def train():
         rgbs, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays_train,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
-        
+
+        ## compute mean and variance
+        rgb_mean = torch.mean(rgbs,-1)
+        rgb_var = torch.zeros(rgb_mean.shape[0])
+        for k in range(rgbs.shape[-1]):
+            rgb_var += torch.mean((rgbs[...,k] - rgb_mean)**2,-1) / rgbs.shape[-1]
+
         ## 
         rgb_avg = torch.mean(rgbs,-1)
         mse_train = img2mse(rgb_avg, target_s)
@@ -977,13 +953,19 @@ def train():
         #     print('train mse: ',mse_show[:10])
         #     print('train var: ',var[:10])
 
+        # Negative Log Likelihood(NLL)
+        kick = 1e-06
+        loss_nll1 = torch.mean(0.5*torch.log(rgb_var+kick))
+        loss_nll2 = torch.mean(0.5*torch.div(torch.mean((target_s - rgb_mean)**2, -1)+kick, rgb_var+kick))
+        loss =  loss_nll1 + loss_nll2 + 5
+
         ## kernel density estimation
-        h = torch.tensor([0.5])
-        loss = -torch.mean(torch.log(torch.mean(torch.exp(torch.div((target_s[...,None].repeat(1,1,1,rgbs.shape[-1]) - rgbs)**2,-2*h*h)),(1,2))))
+        # h = torch.tensor([0.5])
+        # loss = -torch.mean(torch.log(torch.mean(torch.exp(torch.div((target_s[...,None].repeat(1,1,1,rgbs.shape[-1]) - rgbs)**2,-2*h*h)),(1,2))))
         
         if 'rgb0' in extras:
-            loss_0 = -torch.mean(torch.log(torch.mean(torch.exp(torch.div((target_s[...,None].repeat(1,1,1,rgbs.shape[-1]) - extras['rgb0'])**2,-2*h*h)),(1,2))))
-            # loss_0 = torch.mean((torch.mean(extras['rgb0'],-1)-target_s)**2)
+            # loss_0 = -torch.mean(torch.log(torch.mean(torch.exp(torch.div((target_s[...,None].repeat(1,1,1,rgbs.shape[-1]) - extras['rgb0'])**2,-2*h*h)),(1,2))))
+            loss_0 = torch.mean((torch.mean(extras['rgb0'],-1)-target_s)**2)
             loss += loss_0
             rgb0_avg = torch.mean(extras['rgb0'],-1)
             mse_train0 = img2mse(rgb0_avg, target_s)
@@ -992,14 +974,11 @@ def train():
             scalars_to_log['train/psnr0'] = psnr_train0.item()
         
         ## compute entropy using monto-carlo estimator
-        rgb_for_unc = torch.mean(rgbs,-2).data.cpu().numpy() # (B,k3)
-        p_for_unc = rgb_for_unc / (rgb_for_unc.sum(axis=-1, keepdims=True) + 1e-10)
-        unc = (-p_for_unc * np.log2(p_for_unc)).sum(axis=1)
 
         scalars_to_log['train/mse'] = mse_train.item()
         scalars_to_log['train/pnsr'] = psnr_train.item()
         scalars_to_log['train/loss'] = loss.item()
-        scalars_to_log['train/unc'] = np.mean(unc)
+        scalars_to_log['train/unc'] = torch.mean(rgb_var)
 
         ## optimize 1
         optimizer.zero_grad()
@@ -1057,37 +1036,37 @@ def train():
             with torch.no_grad():
                 rgbs, disps = render_path(torch.Tensor(poses[idx_train]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[idx_train]) # rgbs, (N, H, W, 3, k3)
 
+            rgbs = rgbs.squeeze()
             rgbs_train = np.mean(rgbs,-1) # (B,H,W,3)
             mse_ = (rgbs_train.reshape([H,W,3])-images[idx_train].cpu().numpy())**2
             heatmap_mse_ = cv2.applyColorMap(to8b(mse_), cv2.COLORMAP_JET)
             heatmap_mse_ = cv2.cvtColor(heatmap_mse_, cv2.COLOR_BGR2RGB).transpose(2,0,1)
 
+            rgb_var = np.zeros([H,W])
+            for k in range(rgbs.shape[-1]):
+                rgb_var += np.mean((rgbs[...,k] - rgbs_train)**2,-1) / rgbs.shape[-1]
+
             ## compute entropy using Monto-Carlo estimator
-            # rgb_for_unc = np.mean(rgbs,-2).squeeze() # (B,H,W,k3)
-            # p_for_unc = rgb_for_unc / (rgb_for_unc.sum(axis=-1, keepdims=True) + 1e-10)
-            # unc_map = (-p_for_unc * np.log2(p_for_unc)).sum(axis=-1) # (H,W)
-            # unc_map = unc_map / np.max(unc_map)
+            # rgbs = rgbs.squeeze() # (H,W,3,k3)
+            # unc_map = np.zeros(list(rgbs.shape[:-2]))
+            # h = 0.5
+            # for m in range(rgbs.shape[-1]):
+            #     cur_rgb = rgbs[...,m]
+            #     cur_rgb = np.broadcast_to(cur_rgb[...,None],(list(rgbs.shape)))
+            #     unc_map += -np.log(np.mean(np.exp(-(cur_rgb - rgbs)**2 / 2*h*h),(2,3)))
 
-            rgbs = rgbs.squeeze() # (H,W,3,k3)
-            unc_map = np.zeros(list(rgbs.shape[:-2]))
-            h = 0.5
-            for m in range(rgbs.shape[-1]):
-                cur_rgb = rgbs[...,m]
-                cur_rgb = np.broadcast_to(cur_rgb[...,None],(list(rgbs.shape)))
-                unc_map += -np.log(np.mean(np.exp(-(cur_rgb - rgbs)**2 / 2*h*h),(2,3)))
-
-            unc_map /= rgbs.shape[-1]
+            # unc_map /= rgbs.shape[-1]
 
             print(mse_[200,190:210,:])
-            print(unc_map[200,190:210])
-            heatmap_v = cv2.applyColorMap(to8b(unc_map.reshape([H,W,1])), cv2.COLORMAP_JET)
+            print(rgb_var[200,190:210])
+            heatmap_v = cv2.applyColorMap(to8b(rgb_var.reshape([H,W,1])), cv2.COLORMAP_JET)
             heatmap_v = cv2.cvtColor(heatmap_v, cv2.COLOR_BGR2RGB).transpose(2,0,1)
 
             ## correlation R for train image
             if i % 1000 == 0 or i == start+1:
                 mse_r = np.mean(mse_,-1).reshape(-1) # (N,)
                 # cor_mse = np.corrcoef(mse_r, variances)
-                cor_mse = stats.spearmanr(mse_r, unc_map.reshape(-1))
+                cor_mse = stats.spearmanr(mse_r, rgb_var.reshape(-1))
                 print('R for train: ',cor_mse)
 
             img_pred = to8b(rgbs_train.reshape([H,W,3]).transpose(2,0,1))
@@ -1107,34 +1086,40 @@ def train():
             with torch.no_grad():
                 rgbs, disps = render_path(torch.Tensor(poses[idx_val]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[idx_val]) # rgbs, (N, H*W, 3)
             
+            rgbs = rgbs.squeeze()
             rgbs_val = np.mean(rgbs,-1) # (B,H,W,3)
             mse_ = (rgbs_val.reshape([H,W,3])-images[idx_val].cpu().numpy())**2
             heatmap_mse_ = cv2.applyColorMap(to8b(mse_), cv2.COLORMAP_JET)
             heatmap_mse_ = cv2.cvtColor(heatmap_mse_, cv2.COLOR_BGR2RGB).transpose(2,0,1)
 
-            ## compute entropy using Monto-Carlo estimator
-            rgbs = rgbs.squeeze() # (H,W,3,k3)
-            unc_map = np.zeros(list(rgbs.shape[:-2]))
-            h = 0.5
-            for m in range(rgbs.shape[-1]):
-                cur_rgb = rgbs[...,m]
-                cur_rgb = np.broadcast_to(cur_rgb[...,None],(list(rgbs.shape)))
-                unc_map += -np.log(np.mean(np.exp(-(cur_rgb - rgbs)**2 / 2*h*h),(2,3)))
+            rgb_var = np.zeros([H,W])
+            for k in range(rgbs.shape[-1]):
+                rgb_var += np.mean((rgbs[...,k] - rgbs_val)**2,-1) / rgbs.shape[-1]
 
-            unc_map /= rgbs.shape[-1]
+            ## compute entropy using Monto-Carlo estimator
+            # rgbs = rgbs.squeeze() # (H,W,3,k3)
+            # unc_map = np.zeros(list(rgbs.shape[:-2]))
+            # h = 0.5
+            # for m in range(rgbs.shape[-1]):
+            #     cur_rgb = rgbs[...,m]
+            #     cur_rgb = np.broadcast_to(cur_rgb[...,None],(list(rgbs.shape)))
+            #     unc_map += -np.log(np.mean(np.exp(-(cur_rgb - rgbs)**2 / 2*h*h),(2,3)))
+
+            # unc_map /= rgbs.shape[-1]
 
             print(mse_[200,190:210,:])
-            print(unc_map[200,190:210])
+            print(rgb_var[200,190:210])
+            heatmap_v = cv2.applyColorMap(to8b(rgb_var.reshape([H,W,1])), cv2.COLORMAP_JET)
+            heatmap_v = cv2.cvtColor(heatmap_v, cv2.COLOR_BGR2RGB).transpose(2,0,1)
 
             ## correlation R for val image
             if i % 1000 == 0 or i == start+1:
                 mse_r = np.mean(mse_,-1).reshape(-1) # (N,)
                 # cor_mse = np.corrcoef(mse_r, variances)
-                
-                cor_mse = stats.spearmanr(mse_r, unc_map.reshape(-1))
+                cor_mse = stats.spearmanr(mse_r, rgb_var.reshape(-1))
                 print('R for val: ',cor_mse)
 
-            heatmap_v = cv2.applyColorMap(to8b(unc_map.reshape([H,W,1])), cv2.COLORMAP_JET)
+            heatmap_v = cv2.applyColorMap(to8b(rgb_var.reshape([H,W,1])), cv2.COLORMAP_JET)
             heatmap_v = cv2.cvtColor(heatmap_v, cv2.COLOR_BGR2RGB).transpose(2,0,1)
 
             img_pred = to8b(rgbs_val.reshape([H,W,3]).transpose(2,0,1))
@@ -1560,5 +1545,5 @@ def test():
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    # train()
-    test()
+    train()
+    # test()
